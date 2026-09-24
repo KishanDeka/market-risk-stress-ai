@@ -14,16 +14,24 @@ The example portfolio contains synthetic positions in an equity index, a fixed-r
 
 ## Data
 
-Daily data are downloaded from [FRED](https://fred.stlouisfed.org/):
+Daily observations are retrieved from [FRED](https://fred.stlouisfed.org/):
 
 | Series | Description | Use |
-| --- | --- | --- |
+| :--- | :--- | :--- |
 | `SP500` | S&P 500 index | Equity returns and shocks |
 | `VIXCLS` | CBOE Volatility Index | Volatility conditions |
 | `DGS3MO` | 3-month Treasury yield | Short-rate input |
 | `DGS5` | 5-year Treasury yield | Bond valuation and rate shocks |
 
 The initial study period is 2017–2025. Portfolio holdings and risk limits are synthetic and stored in configuration files.
+
+### Licensing & Setup
+* **FRED API Setup:** Set your API key in your environment before downloading data:
+  ```bash
+  export FRED_API_KEY="your_api_key_here"
+
+* **Licensing & Synthetic Fallback:** Due to FRED redistribution restrictions on third-party series (e.g., SP500), raw observations are not bundled in this public repository. By default, the downloader generates deterministic synthetic data for restricted series to allow open-source execution without violating license terms. Real observations are fetched directly via API when run locally with a valid key.
+
 
 ## Stage 1: risk modelling and ML
 
