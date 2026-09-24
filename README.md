@@ -65,7 +65,7 @@ This extension is intended for scenario generation and reverse stress testing, n
 ## Project structure
 
 ```text
-market-risk-stress-testing/
+market-risk-stress-ai/
 ├── configs/
 │   ├── portfolio.yaml
 │   └── scenarios.yaml
@@ -75,14 +75,15 @@ market-risk-stress-testing/
 ├── notebooks/
 │   ├── 01_data_exploration.ipynb
 │   └── 02_regime_analysis.ipynb
-├── src/market_risk/
-│   ├── data.py
-│   ├── instruments.py
-│   ├── portfolio.py
-│   ├── scenarios.py
-│   ├── historical_risk.py
-│   ├── regime_model.py
-│   └── generative_scenarios/
+├── src/
+|   ├── market_risk/
+│       ├── data.py
+│       ├── instruments.py
+│       ├── portfolio.py
+│       ├── scenarios.py
+│       ├── historical_risk.py
+│       ├── regime_model.py
+│    └── gen_market_scenarios/
 ├── scripts/
 │   ├── download_data.py
 │   └── run_stress.py
