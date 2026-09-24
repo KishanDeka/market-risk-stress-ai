@@ -1,30 +1,27 @@
 """
-scripts/download_market_data.py
+scripts/process_data.py
 
 Responsibility:
-    Retrieve and document raw market observations via the official FRED API.
+    - Ingest raw market CSVs produced by `download_market_data.py`.
+    - Clean string inputs, handle FRED missing markers ('.'), and drop nulls.
+    - Align dates across multiple series.
+    - Calculate daily Simple Returns, Log Returns, and Yield Changes.
+    - Document data lineage in a transformation manifest.
 
 Outputs:
-    - data/raw/{series_id}.csv (One raw file per series)
-    - data/raw/download_manifest.json (Source, series ID, retrieval time, coverage, file checksum)
-    - data/raw/quality_summary.json (Row counts, missing observations, duplicate dates, download failures)
-
-Note:
-    - Reads the API key directly from the FRED_API_KEY environment variable.
-    - No data synthetic generation, cleaning, or return calculations are performed here.
+    - data/processed/cleaned_prices.csv
+    - data/processed/market_returns.csv
+    - data/processed/process_manifest.json
 """
 
-import hashlib
 import json
 import logging
-import os
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List
 
+import numpy as np
 import pandas as pd
-import requests
 
 # Set up logging
 logging.basicConfig(
@@ -34,181 +31,134 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Directory Configurations
-RAW_DATA_DIR = Path("data/raw")
-RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-# FRED API Endpoint Configuration
-FRED_BASE_URL = "https://api.stlouisfed.org/fred/series/observations"
-
-# Target FRED Series
-SERIES_CONFIG = [
-    {
-        "series_id": "DGS10",
-        "source": "FRED",
-        "description": "10-Year Treasury Constant Maturity Rate",
-    },
-    {
-        "series_id": "SP500",
-        "source": "FRED",
-        "description": "S&P 500 Index",
-    },
-]
+# Paths
+RAW_DATA_DIR = Path("../data/raw")
+PROCESSED_DATA_DIR = Path("../data/processed")
+PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def get_fred_api_key() -> str:
-    """Retrieves FRED API Key from environment variable or exits gracefully."""
-    api_key = os.getenv("FRED_API_KEY")
-    if not api_key:
-        logger.error(
-            "Environment variable 'FRED_API_KEY' is not set. "
-            "Please export your API key: export FRED_API_KEY='your_key_here'"
-        )
-        sys.exit(1)
-    return api_key
+def load_and_clean_series(file_path: Path, series_id: str) -> pd.DataFrame:
+    """Loads a raw FRED CSV file, handles missing string markers, and parses numeric values."""
+    if not file_path.exists():
+        raise FileNotFoundError(f"Raw data file missing: {file_path}")
+
+    # Read all as string first to safely parse raw FRED text formats
+    df = pd.read_csv(file_path, dtype=str)
+
+    # Standardize column names
+    df.columns = [c.upper().strip() for c in df.columns]
+    if "DATE" not in df.columns:
+        raise ValueError(f"File {file_path} lacks a 'DATE' column.")
+
+    # Convert FRED missing value flag '.' or whitespace into NaN
+    df[series_id] = df[series_id].str.strip()
+    df[series_id] = df[series_id].replace([".", "", "nan", "None", "null"], np.nan)
+
+    # Coerce to numeric float
+    df[series_id] = pd.to_numeric(df[series_id], errors="coerce")
+
+    # Parse dates and drop invalid date rows
+    df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce")
+    df = df.dropna(subset=["DATE"])
+
+    # Sort chronologically and drop duplicate dates if any
+    df = df.sort_values("DATE").drop_duplicates(subset=["DATE"], keep="first")
+
+    return df[["DATE", series_id]]
 
 
-def calculate_sha256(file_path: Path) -> str:
-    """Computes SHA-256 hash for raw file checksum verification."""
-    sha256_hash = hashlib.sha256()
-    with open(file_path, "rb") as f:
-        for byte_block in iter(lambda: f.read(4096), b""):
-            sha256_hash.update(byte_block)
-    return sha256_hash.hexdigest()
+def main() -> None:
+    logger.info("Starting market data processing pipeline...")
+    process_time = datetime.now(timezone.utc).isoformat()
 
+    # Discover raw files
+    raw_files = list(RAW_DATA_DIR.glob("*.csv"))
+    if not raw_files:
+        logger.error(f"No raw CSV files found in {RAW_DATA_DIR}. Aborting.")
+        return
 
-def fetch_fred_api_series(
-    series_id: str,
-    api_key: str,
-    observation_start: Optional[str] = None,
-) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
-    """Retrieves raw observations directly from FRED REST API."""
-    params = {
-        "series_id": series_id,
-        "api_key": api_key,
-        "file_type": "json",
-    }
-    if observation_start:
-        params["observation_start"] = observation_start
+    cleaned_series: List[pd.DataFrame] = []
+    lineage_metrics: Dict[str, Any] = {}
 
-    try:
-        response = requests.get(FRED_BASE_URL, params=params, timeout=15)
-        response.raise_for_status()
-        data = response.json()
+    for file_path in raw_files:
+        series_id = file_path.stem
+        logger.info(f"Cleaning raw series: {series_id}")
 
-        observations = data.get("observations", [])
-        if not observations:
-            return None, "No observations returned from FRED API"
+        df_cleaned = load_and_clean_series(file_path, series_id)
 
-        # Preserve raw payload structure: DATE, <SERIES_ID>
-        df = pd.DataFrame(observations)[["date", "value"]]
-        df.rename(columns={"date": "DATE", "value": series_id}, inplace=True)
-        return df, None
+        raw_count = len(pd.read_csv(file_path))
+        clean_count = df_cleaned[series_id].notnull().sum()
 
-    except requests.exceptions.RequestException as e:
-        error_msg = f"FRED API Request failed: {str(e)}"
-        logger.error(error_msg)
-        return None, error_msg
+        lineage_metrics[series_id] = {
+            "raw_rows": raw_count,
+            "valid_numeric_rows": int(clean_count),
+            "dropped_rows": int(raw_count - clean_count),
+        }
 
+        cleaned_series.append(df_cleaned)
 
-def audit_quality(df: pd.DataFrame, series_col: str) -> Dict[str, Any]:
-    """Calculates basic quality summary metrics on raw observations."""
-    total_rows = len(df)
+    # 1. Merge all series on DATE (Outer join first to inspect total range)
+    merged_df = cleaned_series[0]
+    for df in cleaned_series[1:]:
+        merged_df = pd.merge(merged_df, df, on="DATE", how="outer")
 
-    # Missing observations: Nulls, empty strings, or standard FRED missing flags '.'
-    raw_vals = df[series_col].astype(str).str.strip()
-    missing_count = int(
-        df[series_col].isnull().sum() + (raw_vals.isin([".", "", "nan", "None"])).sum()
-    )
+    merged_df = merged_df.sort_values("DATE").reset_index(drop=True)
 
-    duplicate_dates = int(df["DATE"].duplicated().sum()) if "DATE" in df.columns else 0
+    # Forward fill up to 2 consecutive missing days (e.g., minor holiday misalignments), then drop remaining NAs
+    cleaned_prices = merged_df.ffill(limit=2).dropna().reset_index(drop=True)
 
-    return {
-        "total_row_count": total_rows,
-        "missing_observations_count": missing_count,
-        "duplicate_dates_count": duplicate_dates,
-    }
+    # Save cleaned merged price dataset
+    cleaned_prices_path = PROCESSED_DATA_DIR / "cleaned_prices.csv"
+    cleaned_prices.to_csv(cleaned_prices_path, index=False)
+    logger.info(f"Saved cleaned price series to {cleaned_prices_path}")
 
+    # 2. Calculate Returns
+    returns_df = pd.DataFrame({"DATE": cleaned_prices["DATE"]})
 
-def main(requested_start: str = "2010-01-01") -> None:
-    api_key = get_fred_api_key()
-    manifest_records: List[Dict[str, Any]] = []
-    quality_records: Dict[str, Any] = {}
+    for col in cleaned_prices.columns:
+        if col == "DATE":
+            continue
 
-    retrieval_time = datetime.now(timezone.utc).isoformat()
-
-    for config in SERIES_CONFIG:
-        series_id = config["series_id"]
-        logger.info(f"Retrieving raw series: {series_id}")
-
-        df_raw, failure_reason = fetch_fred_api_series(
-            series_id, api_key, requested_start
-        )
-        raw_filepath = RAW_DATA_DIR / f"{series_id}.csv"
-
-        if df_raw is not None and not df_raw.empty:
-            # Save exact raw file without indices or transformations
-            df_raw.to_csv(raw_filepath, index=False)
-
-            actual_start = df_raw["DATE"].min() if "DATE" in df_raw.columns else "N/A"
-            actual_end = df_raw["DATE"].max() if "DATE" in df_raw.columns else "N/A"
-            checksum = calculate_sha256(raw_filepath)
-
-            quality_summary = audit_quality(df_raw, series_id)
-            quality_summary["download_status"] = "SUCCESS"
-            quality_summary["failure_reason"] = None
-
+        # Check if series is an interest rate/yield (e.g., DGS10, DGS2) or a Price/Index (e.g., SP500)
+        if col.startswith("DGS") or "YIELD" in col.upper():
+            # For Yields: Calculate absolute change in percentage points (and basis points)
+            returns_df[f"{col}_yield_decimal"] = cleaned_prices[col] / 100.0
+            returns_df[f"{col}_daily_change_bps"] = (
+                cleaned_prices[col].diff() * 100.0
+            )  # 1% = 100 bps
         else:
-            checksum = None
-            actual_start = None
-            actual_end = None
-            quality_summary = {
-                "total_row_count": 0,
-                "missing_observations_count": 0,
-                "duplicate_dates_count": 0,
-                "download_status": "FAILED",
-                "failure_reason": failure_reason,
-            }
+            # For Prices/Indices: Calculate Simple & Log Returns
+            returns_df[f"{col}_simple_return"] = cleaned_prices[col].pct_change()
+            returns_df[f"{col}_log_return"] = np.log(
+                cleaned_prices[col] / cleaned_prices[col].shift(1)
+            )
 
-        manifest_records.append(
-            {
-                "series_id": series_id,
-                "source": config["source"],
-                "retrieval_time_utc": retrieval_time,
-                "requested_coverage": {"start_date": requested_start},
-                "actual_coverage": {
-                    "start_date": actual_start,
-                    "end_date": actual_end,
-                },
-                "file_path": str(raw_filepath) if df_raw is not None else None,
-                "sha256_checksum": checksum,
-            }
-        )
+    # Drop the first row which will contain NaN from return calculations
+    returns_df = returns_df.dropna().reset_index(drop=True)
 
-        quality_records[series_id] = quality_summary
+    # Save returns dataset
+    returns_path = PROCESSED_DATA_DIR / "market_returns.csv"
+    returns_df.to_csv(returns_path, index=False)
+    logger.info(f"Saved market returns to {returns_path}")
 
-    # Save Output Manifest
-    manifest_path = RAW_DATA_DIR / "download_manifest.json"
+    # 3. Generate Transformation Manifest
+    manifest = {
+        "processed_at_utc": process_time,
+        "input_files": [str(p) for p in raw_files],
+        "output_files": [str(cleaned_prices_path), str(returns_path)],
+        "aligned_date_range": {
+            "start_date": cleaned_prices["DATE"].min().strftime("%Y-%m-%d"),
+            "end_date": cleaned_prices["DATE"].max().strftime("%Y-%m-%d"),
+            "total_aligned_days": len(cleaned_prices),
+        },
+        "series_lineage": lineage_metrics,
+    }
+
+    manifest_path = PROCESSED_DATA_DIR / "process_manifest.json"
     with open(manifest_path, "w") as f:
-        json.dump(
-            {
-                "generated_at": retrieval_time,
-                "series_count": len(manifest_records),
-                "series": manifest_records,
-            },
-            f,
-            indent=2,
-        )
+        json.dump(manifest, f, indent=2)
 
-    # Save Quality Summary
-    quality_path = RAW_DATA_DIR / "quality_summary.json"
-    with open(quality_path, "w") as f:
-        json.dump(
-            {"evaluated_at": retrieval_time, "metrics": quality_records}, f, indent=2
-        )
-
-    logger.info(f"Done. Manifest saved to {manifest_path}")
-    logger.info(f"Quality Summary saved to {quality_path}")
+    logger.info(f"Transformation manifest saved to {manifest_path}")
 
 
 if __name__ == "__main__":

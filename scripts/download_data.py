@@ -2,7 +2,8 @@
 scripts/download_market_data.py
 
 Responsibility:
-    Retrieve raw market observations via the official FRED API and document metadata.
+    Retrieve raw market observations via the official FRED API or generate 
+    synthetic fallbacks for restricted series, documenting all metadata.
 
 Outputs:
     - data/raw/{series_id}.csv (One raw file per series)
@@ -11,6 +12,7 @@ Outputs:
 
 Note:
     - Reads the API key directly from the FRED_API_KEY environment variable.
+    - Uses synthetic generation for restricted series to allow open-source publishing.
     - Cleaning and return calculations belong in the next script.
     - Exploratory plots belong in notebooks.
 """
@@ -37,13 +39,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Directory Configurations
-RAW_DATA_DIR = Path("data/raw")
+RAW_DATA_DIR = Path("../data/raw")
 RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 # FRED API Configuration
 FRED_BASE_URL = "https://api.stlouisfed.org/fred/series/observations"
 
-# Series configuration
+# Target Series Configuration
+# Public domain series download live via FRED; restricted redistribution series use synthetic generation.
 SERIES_CONFIG = [
     {
         "series_id": "DGS10",
@@ -55,14 +58,15 @@ SERIES_CONFIG = [
         "series_id": "SP500",
         "source": "FRED",
         "description": "S&P 500 Index (Restricted Redistribution)",
-        "synthetic": True,  # Generate synthetic data for open-source repository safety
+        "synthetic": True,  # Enables synthetic data generation for open-source safety
     },
 ]
 
 
 def get_fred_api_key() -> str:
-    """Retrieves FRED API Key from environment variable or exits gracefully."""
+    """Retrieves FRED API Key from environment variable or exits gracefully if required."""
     api_key = os.getenv("FRED_API_KEY")
+    # Only enforce key presence if at least one non-synthetic series is configured
     if not api_key and any(not s["synthetic"] for s in SERIES_CONFIG):
         logger.error(
             "Environment variable 'FRED_API_KEY' is not set. "
@@ -117,17 +121,20 @@ def fetch_fred_api_series(
 
 def generate_synthetic_series(
     series_id: str,
-    start_date: str = "2015-01-01",
+    start_date: str = "2010-01-01",
     end_date: Optional[str] = None,
 ) -> pd.DataFrame:
-    """Generates synthetic price data mirroring S&P 500 structure for public repository compliance."""
+    """
+    Generates synthetic price data mirroring market dynamics via Geometric Brownian Motion.
+    Ensures repository can be published publicly without bundling restricted raw data.
+    """
     if end_date is None:
         end_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     dates = pd.date_range(start=start_date, end=end_date, freq="B")
-    np.random.seed(42)  # Deterministic seed
+    np.random.seed(42)  # Fixed seed for deterministic, reproducible repository runs
 
-    # Geometric Brownian Motion mock series
+    # Geometric Brownian Motion simulation
     returns = np.random.normal(0.0004, 0.012, size=len(dates))
     price_paths = 2000.0 * np.cumprod(1 + returns)
 
@@ -138,7 +145,7 @@ def generate_synthetic_series(
         }
     )
 
-    # Introduce raw '.' missing value typical of FRED raw outputs
+    # Insert raw missing flag '.' to mimic FRED raw output behavior
     if len(df) > 10:
         df.loc[10, series_id] = "."
 
@@ -179,7 +186,7 @@ def main(requested_start: str = "2010-01-01") -> None:
 
         logger.info(f"Processing series: {series_id} (Synthetic={is_synthetic})")
 
-        # 1. Acquire Data
+        # 1. Acquire Data (API vs. Synthetic Generation)
         if is_synthetic:
             df_raw = generate_synthetic_series(series_id, start_date=requested_start)
         else:
@@ -190,15 +197,15 @@ def main(requested_start: str = "2010-01-01") -> None:
         raw_filepath = RAW_DATA_DIR / f"{series_id}.csv"
 
         if df_raw is not None and not df_raw.empty:
-            # Save raw file without index or transformations
+            # Save exact raw file without index or transformations
             df_raw.to_csv(raw_filepath, index=False)
 
-            # Metadata coverage
+            # Extract coverage and verify file integrity
             actual_start = df_raw["DATE"].min() if "DATE" in df_raw.columns else "N/A"
             actual_end = df_raw["DATE"].max() if "DATE" in df_raw.columns else "N/A"
             checksum = calculate_sha256(raw_filepath)
 
-            # Quality Audit
+            # Audit quality
             series_col = (
                 series_id if series_id in df_raw.columns else df_raw.columns[1]
             )
@@ -218,7 +225,7 @@ def main(requested_start: str = "2010-01-01") -> None:
                 "failure_reason": failure_reason,
             }
 
-        # 2. Append Manifest Record
+        # 2. Record Manifest Metadata
         manifest_records.append(
             {
                 "series_id": series_id,
@@ -230,7 +237,7 @@ def main(requested_start: str = "2010-01-01") -> None:
                     "start_date": actual_start,
                     "end_date": actual_end,
                 },
-                "file_path": str(raw_filepath),
+                "file_path": str(raw_filepath) if df_raw is not None else None,
                 "sha256_checksum": checksum,
             }
         )
